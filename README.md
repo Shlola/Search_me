@@ -29,7 +29,7 @@ Kali Linux includes everything above by default.
 ## Installation
 
 ```bash
-git clone https://github.com/Shlola/cat-search.git
+git clone https://github.com/Shlola/Search_me_v2.git
 cd cat-search
 chmod +x Search_me.sh
 ```
