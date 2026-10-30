@@ -1,0 +1,120 @@
+#!/bin/bash
+set -o history
+# Usage: ./Search_me.sh                      (prompts for pattern and path)
+#        ./Search_me.sh "pattern" [path]
+
+SEARCH_TIMEOUT=60   # stop slow regexes (guards against catastrophic backtracking)
+HIST_FILE="${HOME}/.findword_history"
+umask 077           # history file is readable only by you
+
+show_banner() {
+cat << 'EOF'
+  /\_/\   /\_/\
+ ( o.o ) ( ^.^ )
+  > ^ <   > ^ <
+ =========================
+       ~ Cat's search ~
+ =========================
+EOF
+}
+
+# Remove control characters (ESC, CR, etc.) so file contents can't inject
+# terminal escape sequences. Tabs and newlines are kept.
+sanitize() {
+    tr -d '\000-\010\013-\037\177'
+}
+
+# Prints each case variant of the matched text, e.g. "lowercase", "UPPERCASE", "Mixed".
+show_cases() {
+    local pattern="$1"
+    local path="$2"
+    local count match kind
+
+    echo "Case variants found:"
+    timeout "$SEARCH_TIMEOUT" grep -rhoEIi -- "$pattern" "$path" 2>/dev/null \
+        | sanitize | sort | uniq -c | while read -r count match; do
+        if [ "$match" = "${match,,}" ]; then
+            kind="lowercase"
+        elif [ "$match" = "${match^^}" ]; then
+            kind="UPPERCASE"
+        else
+            kind="Mixed"
+        fi
+        echo "  $count x \"$match\" ($kind)"
+    done
+}
+
+show_banner
+echo
+
+# Load previous searches so the up arrow recalls them (read -e uses readline)
+[ -r "$HIST_FILE" ] && history -r "$HIST_FILE"
+
+pattern="${1:-}"
+path="${2:-}"
+
+if [ -z "$pattern" ]; then
+    # -e enables readline: up/down arrows for history, Tab for completion
+    read -e -r -p "Enter a word, sentence, or regex to search for: " pattern
+    # Add the entry to history and save it, keeping it for future runs
+    if [ -n "$pattern" ]; then
+        history -s -- "$pattern"
+        history -w "$HIST_FILE"
+    fi
+fi
+if [ -z "$path" ]; then
+    # Tab completes file and directory names at this prompt
+    read -e -r -p "Enter a file or directory to search in [.]: " path
+    path="${path:-.}"
+fi
+
+if [ -z "$pattern" ]; then
+    echo "Error: search pattern cannot be empty."
+    exit 1
+fi
+
+if [ ! -e "$path" ]; then
+    echo "Error: '$path' does not exist."
+    exit 1
+fi
+
+# Exit status 2 from grep means the pattern is not a valid regex
+grep -E -- "$pattern" /dev/null 2>/dev/null
+if [ $? -eq 2 ]; then
+    echo "Error: '$pattern' is not a valid regular expression."
+    exit 1
+fi
+
+# Temporary files, cleaned up on exit
+tmp_out=$(mktemp) && tmp_err=$(mktemp) || { echo "Error: could not create temp files."; exit 1; }
+trap 'rm -f "$tmp_out" "$tmp_err"' EXIT
+
+# -E: extended regex, -r: recursive, -n: line numbers, -H: filenames,
+# -I: skip binary files, -i: ignore case
+timeout "$SEARCH_TIMEOUT" grep -rnEHIi -- "$pattern" "$path" >"$tmp_out" 2>"$tmp_err"
+status=$?
+
+if [ "$status" -eq 124 ]; then
+    echo "Error: search stopped after ${SEARCH_TIMEOUT}s. Try a simpler pattern or a smaller directory."
+    exit 1
+fi
+
+# Show real errors, but hide "Permission denied" noise from directories you can't read
+grep -v 'Permission denied' "$tmp_err" | sed 's/^/Warning: /' >&2
+
+if [ ! -s "$tmp_out" ]; then
+    if [ "$status" -ge 2 ]; then
+        echo "No matches found, and the search finished with errors (see warnings above)."
+    else
+        echo "'$pattern' was not found in '$path'."
+    fi
+    exit 0
+fi
+
+# Highlight matches in pink (case-insensitive, matching the search above).
+# The text is sanitized first, then re-scanned for coloring.
+# Note: in rare cases the pattern may also match a filename or line number and color it.
+sanitize < "$tmp_out" | GREP_COLORS='ms=1;38;5;205:mc=1;38;5;205' grep --color=always -Ei -- "$pattern"
+
+echo
+show_cases "$pattern" "$path"
