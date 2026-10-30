@@ -1,0 +1,299 @@
+#!/bin/bash
+# Usage: ./Search_me.sh                      (interactive: presets, options, prompts)
+#        ./Search_me.sh "pattern" [path]     (quick search with default options)
+
+set -o history      # lets read -e and history -r work inside a script
+
+SEARCH_TIMEOUT=60   # stop slow regexes (guards against catastrophic backtracking)
+HIST_FILE="${HOME}/.findword_history"
+REPORT_DIR="${HOME}/findword_reports"
+MAX_CONTEXT=10
+umask 077           # history and reports are readable only by you
+
+# Preset indicator patterns (the number picks one at the prompt)
+PRESET_NAMES=(
+    "IPv4 address"
+    "Email address"
+    "URL (http/https)"
+    "MD5 hash"
+    "SHA-1 hash"
+    "SHA-256 hash"
+    "Long Base64 blob"
+)
+PRESET_RE=(
+    '((25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])\.){3}(25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])'
+    '[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}'
+    'https?://[^[:space:]<>"]+'
+    '\b[a-fA-F0-9]{32}\b'
+    '\b[a-fA-F0-9]{40}\b'
+    '\b[a-fA-F0-9]{64}\b'
+    '[A-Za-z0-9+/]{40,}={0,2}'
+)
+
+# Directories that are rarely worth searching, including our own reports
+EXCLUDES=(--exclude-dir=.git --exclude-dir=node_modules --exclude-dir=__pycache__ --exclude-dir=findword_reports)
+
+# grep color settings: filename cyan, line number gray, separators gray, matches pink
+COLORS='fn=1;36:ln=90:bn=90:se=90:ms=1;38;5;205:mc=1;38;5;205'
+
+show_banner() {
+cat << 'EOF'
+  /\_/\   /\_/\
+ ( o.o ) ( ^.^ )
+  > ^ <   > ^ <
+ =========================
+       ~ Cat's search ~
+ =========================
+EOF
+}
+
+# Remove control characters (ESC, CR, etc.) so file contents can't inject
+# terminal escape sequences. Tabs and newlines are kept.
+sanitize() {
+    tr -d '\000-\010\013-\037\177'
+}
+
+# Decode .eml files in $1 (a file or directory) into plain text files in $2.
+# Writes the headers plus the plain-text or HTML body, so base64 and
+# quoted-printable content becomes searchable. Symlinks are skipped.
+decode_eml() {
+timeout "$SEARCH_TIMEOUT" python3 - "$1" "$2" <<'PY'
+import os, sys
+from email import message_from_binary_file, policy
+
+src, dst = sys.argv[1], sys.argv[2]
+
+def decode(path, rel):
+    out = os.path.join(dst, rel + ".txt")
+    os.makedirs(os.path.dirname(out), exist_ok=True)
+    try:
+        with open(path, "rb") as fh:
+            msg = message_from_binary_file(fh, policy=policy.default)
+        lines = [f"{h}: {msg[h]}" for h in ("Subject", "From", "To", "Date") if msg[h] is not None]
+        lines.append("")
+        body = msg.get_body(preferencelist=("plain", "html"))
+        if body is not None:
+            lines.append(body.get_content())
+        with open(out, "w", encoding="utf-8", errors="replace") as o:
+            o.write("\n".join(lines))
+    except Exception as e:
+        sys.stderr.write(f"Could not decode {path}: {e}\n")
+
+SKIP_DIRS = (".git", "node_modules", "__pycache__", "findword_reports")
+
+if os.path.isfile(src):
+    if src.lower().endswith(".eml") and not os.path.islink(src):
+        decode(src, os.path.basename(src))
+else:
+    for root, dirs, files in os.walk(src):
+        dirs[:] = [d for d in dirs if d not in SKIP_DIRS]
+        for f in files:
+            p = os.path.join(root, f)
+            if f.lower().endswith(".eml") and not os.path.islink(p):
+                decode(p, os.path.relpath(p, src))
+PY
+}
+
+# Counts matching lines (without context lines) in the original files and the
+# decoded email text, so the number reflects real matches.
+count_matches() {
+    { grep -rEIic "${WORD_OPT[@]}" "${EXCLUDES[@]}" --exclude='*.eml' -- "$pattern" "$path"
+      grep -rEIic "${WORD_OPT[@]}" -- "$pattern" "$tmp_dec"; } 2>/dev/null \
+    | awk -F: '{ s += $NF } END { print s + 0 }'
+}
+
+# Prints each case variant of the matched text, sorted by count (highest first).
+# Searches the original files and the decoded .eml text.
+show_cases() {
+    local pattern="$1" path="$2" decdir="$3"
+    local count match kind
+
+    echo "Case variants found:"
+    timeout "$SEARCH_TIMEOUT" grep -rhoEIi "${WORD_OPT[@]}" "${EXCLUDES[@]}" --exclude='*.eml' \
+        -- "$pattern" "$path" "$decdir" 2>/dev/null \
+        | sanitize | sort | uniq -c | sort -rn | while read -r count match; do
+        if [[ ! "$match" =~ [[:alpha:]] ]]; then
+            kind="no letters"
+        elif [ "$match" = "${match,,}" ]; then
+            kind="lowercase"
+        elif [ "$match" = "${match^^}" ]; then
+            kind="UPPERCASE"
+        else
+            kind="Mixed"
+        fi
+        echo "  $count x \"$match\" ($kind)"
+    done
+}
+
+show_banner
+echo
+
+# Load previous searches so the up arrow recalls them
+[ -r "$HIST_FILE" ] && history -r "$HIST_FILE"
+
+pattern="${1:-}"
+path="${2:-}"
+interactive=0
+typed=0
+whole=0
+context=0
+save=0          # quick mode does not save reports; interactive mode asks
+
+if [ -z "$pattern" ]; then
+    interactive=1
+    echo "Presets:"
+    for i in "${!PRESET_NAMES[@]}"; do
+        printf "  %d) %s\n" $((i + 1)) "${PRESET_NAMES[$i]}"
+    done
+    read -e -r -p "Preset number, or type your own pattern (Enter to type): " choice
+    if [[ "$choice" =~ ^[0-9]+$ ]]; then
+        if [ "$choice" -ge 1 ] && [ "$choice" -le "${#PRESET_RE[@]}" ]; then
+            pattern="${PRESET_RE[$((choice - 1))]}"
+            echo "Using preset: ${PRESET_NAMES[$((choice - 1))]}"
+        else
+            echo "Error: there is no preset $choice."
+            exit 1
+        fi
+    elif [ -n "$choice" ]; then
+        pattern="$choice"
+        typed=1
+    else
+        read -e -r -p "Enter a word, sentence, or regex to search for: " pattern
+        typed=1
+    fi
+    # Save typed patterns to history for the up arrow
+    if [ "$typed" = 1 ] && [ -n "$pattern" ]; then
+        history -s -- "$pattern"
+        history -w "$HIST_FILE"
+    fi
+fi
+
+if [ -z "$path" ]; then
+    read -e -r -p "Enter a file or directory to search in [.]: " path
+    path="${path:-.}"
+fi
+
+# read -e doesn't expand ~, so do it here
+path="${path/#\~/$HOME}"
+
+if [ "$interactive" = 1 ]; then
+    read -r -p "Whole words only? [y/N]: " yn
+    [[ "$yn" =~ ^[Yy] ]] && whole=1
+
+    read -r -p "Lines of context around each match [0]: " context
+    if ! [[ "$context" =~ ^[0-9]+$ ]]; then
+        context=0
+    elif [ "$context" -gt "$MAX_CONTEXT" ]; then
+        context="$MAX_CONTEXT"
+    fi
+
+    read -r -p "Save a timestamped report? [Y/n]: " yn
+    if [[ "$yn" =~ ^[Nn] ]]; then save=0; else save=1; fi
+fi
+
+if [ -z "$pattern" ]; then
+    echo "Error: search pattern cannot be empty."
+    exit 1
+fi
+
+if [ ! -e "$path" ]; then
+    echo "Error: '$path' does not exist."
+    exit 1
+fi
+
+# Exit status 2 from grep means the pattern is not a valid regex
+grep -E -- "$pattern" /dev/null 2>/dev/null
+if [ $? -eq 2 ]; then
+    echo "Error: '$pattern' is not a valid regular expression."
+    exit 1
+fi
+
+# Temporary files and folders, removed on exit
+tmp_out=""; tmp_err=""; tmp_dout=""; tmp_dec=""
+trap 'rm -rf "$tmp_out" "$tmp_err" "$tmp_dout" "$tmp_dec"' EXIT
+tmp_out=$(mktemp)    || { echo "Error: could not create temp files."; exit 1; }
+tmp_err=$(mktemp)    || { echo "Error: could not create temp files."; exit 1; }
+tmp_dout=$(mktemp)   || { echo "Error: could not create temp files."; exit 1; }
+tmp_dec=$(mktemp -d) || { echo "Error: could not create temp files."; exit 1; }
+
+WORD_OPT=()
+[ "$whole" = 1 ] && WORD_OPT=(-w)
+CTX_OPT=()
+[ "$context" -gt 0 ] && CTX_OPT=(-C "$context")
+
+# Decode .eml bodies into a temp folder so they can be searched
+if command -v python3 >/dev/null 2>&1; then
+    decode_eml "$path" "$tmp_dec" 2>>"$tmp_err"
+else
+    echo "Warning: python3 not found, so .eml bodies were not decoded." >&2
+fi
+
+# Search the original files (skipping raw .eml, which is covered by the decoded text)
+timeout "$SEARCH_TIMEOUT" grep -rnEHIi "${WORD_OPT[@]}" "${CTX_OPT[@]}" "${EXCLUDES[@]}" \
+    --exclude='*.eml' -- "$pattern" "$path" >"$tmp_out" 2>>"$tmp_err"
+s1=$?
+
+# Search the decoded email text (plain, for the report and the empty check)
+timeout "$SEARCH_TIMEOUT" grep -rnEHIi "${WORD_OPT[@]}" "${CTX_OPT[@]}" \
+    -- "$pattern" "$tmp_dec" >"$tmp_dout" 2>>"$tmp_err"
+s2=$?
+sed "s#$tmp_dec/#[decoded] #" "$tmp_dout" >>"$tmp_out"
+
+if [ "$s1" -eq 124 ] || [ "$s2" -eq 124 ]; then
+    echo "Error: search stopped after ${SEARCH_TIMEOUT}s. Try a simpler pattern or a smaller directory."
+    exit 1
+fi
+
+# Show real errors, but hide "Permission denied" noise. Sanitized because
+# filenames in the errors come from the file system.
+grep -v 'Permission denied' "$tmp_err" | sanitize | sed 's/^/Warning: /' >&2
+
+if [ ! -s "$tmp_out" ]; then
+    if [ "$s1" -ge 2 ] || [ "$s2" -ge 2 ]; then
+        echo "No matches found, and some locations could not be read (see warnings above)."
+    else
+        echo "'$pattern' was not found in '$path'."
+    fi
+    exit 0
+fi
+
+matches=$(count_matches)
+echo "$matches matching line(s) found:"
+echo
+
+# Colored view of the original files: filename, line number, and match are
+# colored by grep itself, so nothing is parsed by the script.
+GREP_COLORS="$COLORS" timeout "$SEARCH_TIMEOUT" grep -rnEHIi --color=always \
+    "${WORD_OPT[@]}" "${CTX_OPT[@]}" "${EXCLUDES[@]}" --exclude='*.eml' \
+    -- "$pattern" "$path" 2>/dev/null
+
+# Colored view of the decoded email text. It runs inside the temp folder, so
+# filenames show as the decoded names (for example ./msg-01.eml.txt).
+if [ -s "$tmp_dout" ]; then
+    echo
+    echo "From decoded email text:"
+    (cd "$tmp_dec" && GREP_COLORS="$COLORS" timeout "$SEARCH_TIMEOUT" grep -rnEHIi \
+        --color=always "${WORD_OPT[@]}" "${CTX_OPT[@]}" -- "$pattern" . 2>/dev/null)
+fi
+
+echo
+show_cases "$pattern" "$path" "$tmp_dec"
+
+if [ "$save" = 1 ]; then
+    mkdir -p "$REPORT_DIR"
+    report="$REPORT_DIR/report_$(date +%Y%m%d_%H%M%S).txt"
+    {
+        echo "Cat's search report"
+        echo "Date:    $(date '+%Y-%m-%d %H:%M:%S')"
+        echo "Pattern: $pattern"
+        echo "Path:    $path"
+        echo "Options: whole-word=$whole, context=$context"
+        echo
+        echo "$matches matching line(s):"
+        sanitize < "$tmp_out"
+        echo
+        show_cases "$pattern" "$path" "$tmp_dec"
+    } > "$report"
+    echo
+    echo "Report saved to $report"
+fi
